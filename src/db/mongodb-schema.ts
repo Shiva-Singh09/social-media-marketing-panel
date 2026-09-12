@@ -167,6 +167,15 @@ export interface ITransaction extends Document {
   description?: string | null;
   razorpayPaymentId?: string | null;
   razorpayOrderId?: string | null;
+  /**
+   * Refund idempotency (P2 hardening). Set ONLY on refund transactions: the
+   * _id of the Order that was refunded. A sparse-unique index (below) makes
+   * "one refund per order" a hard database constraint, so duplicate or
+   * concurrent refund attempts are rejected with E11000 instead of
+   * double-crediting a wallet. Deduplication must use this field — never the
+   * mutable, free-form `description` string.
+   */
+  refundForOrderId?: mongoose.Types.ObjectId | null;
   paymentStatus: PaymentStatus;
   createdAt: Date;
 }
@@ -388,6 +397,17 @@ const TransactionSchema = new Schema<ITransaction>(
     description: { type: String, default: null },
     razorpayPaymentId: { type: String, default: null },
     razorpayOrderId: { type: String, default: null },
+    /**
+     * Refund idempotency (P2): the Order this refund belongs to. Null for
+     * payments/debits. Backed by a sparse-unique index below — one refund
+     * transaction per order at the database level. Idempotency lookups must
+     * use this field, never the mutable `description` text.
+     */
+    refundForOrderId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Order',
+      default: null,
+    },
     paymentStatus: { 
       type: String, 
       enum: Object.values(PaymentStatus),
@@ -403,6 +423,18 @@ const TransactionSchema = new Schema<ITransaction>(
 
 TransactionSchema.index({ userId: 1 });
 TransactionSchema.index({ razorpayOrderId: 1 }, { sparse: true });
+/**
+ * Refund idempotency constraint (P2): at most ONE refund transaction per
+ * order. Sparse → nulls (payments, admin adjustments) are unindexed and can
+ * repeat freely; a second refund for the same order is rejected with E11000,
+ * which aborts the surrounding financial transaction and rolls back any
+ * partial credit — the backstop behind the conditional status-claim latch in
+ * the admin order-update route.
+ */
+TransactionSchema.index(
+  { refundForOrderId: 1 },
+  { unique: true, sparse: true },
+);
 TransactionSchema.index({ createdAt: -1 });
 
 /**

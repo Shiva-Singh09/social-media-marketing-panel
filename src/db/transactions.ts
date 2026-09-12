@@ -12,12 +12,11 @@
  * goes through {@link runInTransaction}:
  *
  *   - Replica set / Atlas → real ACID multi-document transactions (as before).
- *   - Standalone          → operations run without a session. Single-document
- *     writes ($cond balance deduction, $inc) remain atomic per document; the
- *     cross-document steps (Order + Transaction rows) become individually
- *     atomic instead of jointly atomic — acceptable for dev, and loudly
- *     warned about once per process so nobody mistakes it for production
- *     safety.
+ *   - Standalone          → development/test runs sequentially without a
+ *     session (single-document writes like the $cond balance deduction and
+ *     $inc stay atomic per document; the cross-document steps become
+ *     individually atomic instead of jointly atomic). PRODUCTION refuses to
+ *     run at all (fail-closed): see runInTransaction below.
  */
 
 import mongoose from "mongoose";
@@ -96,7 +95,31 @@ export async function runInTransaction<T>(
     }
   }
 
-  // Fallback: no session available — execute sequentially.
+  // Production: FAIL CLOSED. A financial operation that cannot run inside a
+  // real multi-document transaction must never silently execute as separate
+  // non-atomic writes (half-applied credits/refunds are money bugs). No write
+  // is performed; callers translate `{ ok: false }` into their normal 5xx
+  // error responses, so unrelated non-financial functionality is untouched.
+  if (process.env.NODE_ENV === "production") {
+    const error = new Error(
+      "MongoDB deployment does not support multi-document transactions; " +
+        "financial operation refused (fail-closed)",
+    );
+    console.error(
+      "[db] Financial operation BLOCKED: the connected MongoDB deployment " +
+        "does not support multi-document transactions (standalone server?). " +
+        "Production requires a replica set (a single-node one is enough: " +
+        'mongod --replSet rs0, URI "...?replicaSet=rs0") or Atlas. ' +
+        "No financial write was performed.",
+    );
+    return { ok: false, error };
+  }
+
+  // Development/test fallback: execute sequentially without a session.
+  // Single-document writes ($cond balance deduction, $inc) remain atomic per
+  // document; the cross-document steps (Order + Transaction rows) become
+  // individually atomic instead of jointly atomic — acceptable outside
+  // production, and loudly detected above rather than silently trusted.
   try {
     const result = await fn(null);
     return { ok: true, result };
