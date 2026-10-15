@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { Order, Service, Category, Transaction, User } from "@/db";
 import { runInTransaction, txOpts } from "@/db/transactions";
-import { fail, handle, num, ok, parsePagination } from "@/lib/api";
+import { fail, handle, literalSearchTerm, num, ok, parsePagination } from "@/lib/api";
 import { requireUser } from "@/lib/auth";
 import { limitOrFail } from "@/lib/rate-limit";
 import { resolveServicePricing, userCostForQuantity } from "@/lib/pricing";
@@ -21,7 +22,8 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const { page, limit, offset } = parsePagination(url);
     const status = asEnumValue(url.searchParams.get("status"), ORDER_STATUSES);
-    const search = url.searchParams.get("search")?.trim();
+    // Literal, length-bounded search — user input can never act as a regex.
+    const search = literalSearchTerm(url.searchParams.get("search"));
 
     const filter: Record<string, unknown> = { userId: user._id };
     if (status) filter.status = status;
@@ -158,6 +160,10 @@ export async function POST(req: Request) {
             totalCost,
             status: "pending",
             remains: quantity,
+            // Marks this as a MANUAL-fulfilment order: the order worker
+            // (Phase 2C-2) filters these out via `clientRequestId` so the
+            // legacy flow keeps its existing admin-driven behavior.
+            clientRequestId: `manual-${randomUUID()}`,
           },
         ],
         txOpts(session),

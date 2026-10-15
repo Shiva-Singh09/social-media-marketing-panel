@@ -1,4 +1,5 @@
 import { Transaction, User } from "@/db";
+import { PaymentStatus } from "@/db/mongodb-schema";
 import { runInTransaction, txOpts } from "@/db/transactions";
 import { fail, handle, num, ok } from "@/lib/api";
 import { verifyWebhookSignature } from "@/lib/razorpay";
@@ -34,6 +35,9 @@ export async function POST(req: Request) {
 
     const txn = await Transaction.findOne({ razorpayOrderId: entity.order_id });
     if (!txn) return ok({ ignored: true }, "Unknown order");
+
+    // Idempotency: a transaction that already succeeded (verify path or a
+    // prior webhook delivery) must never be credited twice.
     if (txn.paymentStatus === "success") return ok({ duplicate: true }, "Already credited");
 
     const amount = num(txn.amount);
@@ -58,15 +62,34 @@ export async function POST(req: Request) {
 
     // Runs as a real ACID transaction on replica sets; falls back to plain
     // writes on standalone MongoDB (see src/db/transactions.ts).
+    //
+    // Idempotency: we re-load the transaction INSIDE the transaction (with the
+    // session) so the check sees committed state from any concurrent webhook.
+    // Then we use an atomic conditional update — only transition PENDING→success.
+    // A concurrent webhook that already committed will leave paymentStatus=success,
+    // causing this update to affect 0 documents and skip the credit.
     const { ok: succeeded } = await runInTransaction(async (session) => {
+      // Re-fetch with the session so we see any concurrent commit.
+      const current = await Transaction.findOne({ razorpayOrderId: entity.order_id })
+        .session(session);
+      if (!current) return;
+      if (current.paymentStatus !== PaymentStatus.PENDING) return; // already credited/failed
+
       await User.findByIdAndUpdate(
-        txn.userId,
+        current.userId,
         { $inc: { creditBalance: amount } },
         txOpts(session),
       );
-      txn.paymentStatus = "success";
-      txn.razorpayPaymentId = entity.id ?? null;
-      await txn.save(txOpts(session));
+      await Transaction.updateOne(
+        { _id: current._id, paymentStatus: PaymentStatus.PENDING },
+        {
+          $set: {
+            paymentStatus: PaymentStatus.SUCCESS,
+            razorpayPaymentId: entity.id ?? null,
+          },
+        },
+        txOpts(session),
+      );
     });
 
     if (!succeeded) return fail("Webhook processing failed", 500);

@@ -27,6 +27,11 @@ export const RATE_RULES = {
   accounts: { windowMs: 60 * 1000, max: 15 },
   // Cron-triggered due-post processing: at most once per minute.
   smmProcess: { windowMs: 60 * 1000, max: 2 },
+  // Cron-triggered order submission-recovery processing: the worker polls the
+  // provider and therefore shares the smmProcess cadence (cheap reads, small
+  // bounded batch). Kept as a SEPARATE named rule so the two cron endpoints
+  // cannot starve each other out of their 2/minute budgets.
+  ordersProcess: { windowMs: 60 * 1000, max: 2 },
 } satisfies Record<string, RateRule>;
 
 /**
@@ -91,7 +96,7 @@ async function increment(key: string, windowMs: number): Promise<{ count: number
     
     if (!bucket || bucket.resetAt <= now) {
       // Create new or reset expired bucket
-      const updated = await RateLimitBucket.findByIdAndUpdate(
+      await RateLimitBucket.findByIdAndUpdate(
         key,
         {
           _id: key,
@@ -112,8 +117,9 @@ async function increment(key: string, windowMs: number): Promise<{ count: number
       return { count: updated?.count ?? 1 };
     }
   } catch (error) {
-    // Fail open on infra errors so a DB hiccup never takes the whole API down
-     
+    // Infrastructure failure: rethrow and let rateLimit() decide — sensitive
+    // rules fail closed (503), general rules fail open. The raw error is
+    // never serialized into a response.
     console.error("[rate-limit:error] backing store unavailable");
     throw error;
   }
