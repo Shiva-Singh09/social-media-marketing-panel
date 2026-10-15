@@ -29,15 +29,28 @@ const MAX_READ_RETRIES = 2;
  * Typed error thrown for any provider-side or configuration failure.
  * Messages are safe to surface to clients: they never contain the API key,
  * auth headers, or raw request bodies.
+ *
+ * `httpStatus` (when the failure came from a non-2xx HTTP response) and the
+ * low-level `cause` (transport failures) are exposed so the order worker can
+ * classify failures as transient / permanent / ambiguous WITHOUT changing
+ * the safe, client-facing message.
  */
 export class SmmApiError extends Error {
   /** Optional machine-readable kind for callers that want to branch on it. */
   kind: "config" | "network" | "timeout" | "provider" | "parse";
+  /** HTTP status when the failure came from a non-2xx response; else undefined. */
+  httpStatus?: number;
 
-  constructor(message: string, kind: SmmApiError["kind"] = "provider") {
+  constructor(
+    message: string,
+    kind: SmmApiError["kind"] = "provider",
+    options?: { httpStatus?: number; cause?: unknown },
+  ) {
     super(message);
     this.name = "SmmApiError";
     this.kind = kind;
+    if (options?.httpStatus !== undefined) this.httpStatus = options.httpStatus;
+    if (options?.cause !== undefined) (this as { cause?: unknown }).cause = options.cause;
   }
 }
 
@@ -113,7 +126,9 @@ async function smmRequest<T>(action: string, params: SmmParams = {}, options: Sm
 
       // Provider signals failures either through HTTP status or `{ error }`.
       if (!res.ok) {
-        throw new SmmApiError(`Provider request failed (HTTP ${res.status}).`, "provider");
+        throw new SmmApiError(`Provider request failed (HTTP ${res.status}).`, "provider", {
+          httpStatus: res.status,
+        });
       }
       if (json !== null && typeof json === "object" && "error" in json) {
         const message = (json as { error?: unknown }).error;
@@ -146,7 +161,11 @@ function normalizeSmmError(error: unknown): SmmApiError {
     if (error.name === "TimeoutError" || error.name === "AbortError") {
       return new SmmApiError("The social media service took too long to respond.", "timeout");
     }
-    return new SmmApiError("Could not reach the social media service.", "network");
+    // Preserve the low-level cause (e.g. Node cause.code) so callers can
+    // distinguish "request never left" from "connection broke mid-flight".
+    return new SmmApiError("Could not reach the social media service.", "network", {
+      cause: error,
+    });
   }
   return new SmmApiError("Unexpected social media service failure.", "network");
 }

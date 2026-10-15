@@ -154,6 +154,46 @@ export interface IOrder extends Document {
   remains?: number | null;
   /** Numeric order id returned by the SMM provider (automated orders). */
   smmOrderId?: number | null;
+  /**
+   * Wallet debit transaction that paid for this order (Phase 2C-1). A real
+   * reference replacing the legacy free-text "Order #<id>" description
+   * linkage, so reconciliation can reliably resolve "which exact debit
+   * belongs to this order". Optional/nullable: legacy documents predate it
+   * and the order-creation flow populates it in a later phase.
+   */
+  debitTransactionId?: mongoose.Types.ObjectId | null;
+  /**
+   * Client-supplied idempotency key (Phase 2C-1 foundation). Uniqueness is
+   * scoped PER USER via a partial unique index (below) — different users may
+   * reuse the same key. No route populates this yet; the behavioral wiring
+   * (zod field + create-time claim) is a later phase.
+   */
+  clientRequestId?: string;
+  /**
+   * Worker automation state (Phase 2C-2). ALL fields persist on the document
+   * so retries/claims survive process and deployment restarts — never
+   * in-memory only.
+   */
+  /** Number of provider `add` submissions STARTED (incremented before each call). */
+  smmAttempts?: number;
+  /** Earliest time the worker may attempt the next submission. */
+  nextRetryAt?: Date | null;
+  /** Atomic worker claim expiry — two workers can never process one order. */
+  workerClaimUntil?: Date | null;
+  /** Sanitized last submission/provider failure (safe to store and show). */
+  smmLastError?: string | null;
+  /** Consecutive failed provider-status polls for an order in `processing`/`pending` with a smmOrderId. */
+  pollFailCount?: number;
+  /** True when the outcome is ambiguous/unrecoverable automatically — needs manual review. */
+  needsReview?: boolean;
+  /** Last raw provider status string observed during polling (observability). */
+  smmStatus?: string | null;
+  /**
+   * True while a provider submission is in progress and its outcome is not
+   * yet recorded (write-ahead marker). A claim that expires with this flag
+   * still true means the process died mid-call → ambiguous → manual review.
+   */
+  submissionInFlight?: boolean;
   adminNote?: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -363,8 +403,30 @@ const OrderSchema = new Schema<IOrder>(
     },
     startCount: { type: Number, default: null },
     remains: { type: Number, default: null },
-    smmOrderId: { type: Number, default: null }, // provider order id (automated flow)
+    /**
+     * Numeric order id returned by the SMM provider. Deliberately NO schema
+     * default: MongoDB sparse indexes skip only ABSENT fields — explicit
+     * nulls share one null key and would collide under the unique sparse
+     * index below (same pattern as Transaction.refundForOrderId). Orders
+     * without a provider id leave this field absent.
+     */
+    smmOrderId: { type: Number },
     adminNote: { type: String, default: null },
+    /** Real reference to the wallet debit transaction (see IOrder). */
+    debitTransactionId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Transaction',
+      default: null,
+    },
+    /** Client idempotency key — absent unless supplied (see IOrder). */
+    clientRequestId: { type: String },
+    // ---- Worker automation state (Phase 2C-2) — persisted for restart safety ----
+    smmAttempts: { type: Number, default: 0 },
+    nextRetryAt: { type: Date, default: null },
+    workerClaimUntil: { type: Date, default: null },
+    smmLastError: { type: String, default: null },
+    needsReview: { type: Boolean, default: false },
+    pollFailCount: { type: Number, default: 0, min: 0 },    smmStatus: { type: String, default: null },    submissionInFlight: { type: Boolean, default: false },
   },
   { 
     timestamps: true,
@@ -376,6 +438,46 @@ OrderSchema.index({ userId: 1 });
 OrderSchema.index({ serviceId: 1 });
 OrderSchema.index({ status: 1 });
 OrderSchema.index({ createdAt: -1 });
+/**
+ * Provider-order idempotency (Phase 2C-1): at most ONE local order may claim
+ * a given external provider order id — a crash/retry that double-submits an
+ * order to the SMM provider is rejected with E11000 instead of silently
+ * creating two paid provider orders.
+ *
+ * Sparse is required (orders legitimately lack a provider id while
+ * pending/failed) and the field therefore has NO schema default, because
+ * MongoDB sparse indexes skip only ABSENT fields while explicit nulls are
+ * indexed and would collide (same reasoning as Transaction.refundForOrderId).
+ *
+ * Existing-data risk: documents written BEFORE this change carry an explicit
+ * `smmOrderId: null` (old schema default). If two or more such documents
+ * exist when this index is built, the build fails with E11000 on null and
+ * the index simply stays absent until the planned controlled DB reset
+ * removes those documents. No data is modified in this phase.
+ */
+OrderSchema.index({ smmOrderId: 1 }, { unique: true, sparse: true });
+/**
+ * Request-idempotency foundation (Phase 2C-1): per-user uniqueness of a
+ * client-supplied key. A partialFilterExpression (NOT `sparse`) is required
+ * for compound uniqueness over an optional field — a compound sparse index
+ * would still index every document (userId is always present) and collide
+ * on the missing clientRequestId. No route populates this field yet, so the
+ * index stays empty until the later idempotency phase wires it in.
+ */
+OrderSchema.index(
+  { userId: 1, clientRequestId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { clientRequestId: { $type: 'string' } },
+  },
+);
+/**
+ * Worker queue index (Phase 2C-2): both worker queries select on
+ * (status, smmOrderId) — submission (status=pending, smmOrderId absent) and
+ * status polling (smmOrderId present, status active). Keeps cron candidate
+ * scans bounded and cheap.
+ */
+OrderSchema.index({ status: 1, smmOrderId: 1 });
 
 /**
  * TRANSACTIONS COLLECTION
@@ -398,15 +500,15 @@ const TransactionSchema = new Schema<ITransaction>(
     razorpayPaymentId: { type: String, default: null },
     razorpayOrderId: { type: String, default: null },
     /**
-     * Refund idempotency (P2): the Order this refund belongs to. Null for
-     * payments/debits. Backed by a sparse-unique index below — one refund
-     * transaction per order at the database level. Idempotency lookups must
-     * use this field, never the mutable `description` text.
+     * Refund idempotency (P2): the Order this refund belongs to. Undefined
+     * (absent) for payments/debits — deliberately NO schema default, because
+     * Mongoose would persist explicit `null`s and a sparse-unique index skips
+     * only ABSENT fields (explicit nulls share one null key and would collide
+     * under uniqueness). Refund transactions set this explicitly.
      */
     refundForOrderId: {
       type: Schema.Types.ObjectId,
       ref: 'Order',
-      default: null,
     },
     paymentStatus: { 
       type: String, 
@@ -557,8 +659,126 @@ const AdminAuditLogSchema = new Schema<IAdminAuditLog>(
 AdminAuditLogSchema.index({ adminId: 1 });
 AdminAuditLogSchema.index({ createdAt: -1 });
 
-// ============================================================================
-// MODEL EXPORTS
+// ==============================================================================
+// ADMIN NOTIFICATIONS
+// Operational notifications for admin observability (Phase 2C-6).
+// Admin-visible alerts for genuinely actionable conditions: permanent provider
+// submission failures, orders needing review, max-retry exhaustion, ambiguous
+// provider results, and repeated status-polling failures. NOT a user-facing
+// inbox — every notification is addressed to a recipient admin user.
+// ==============================================================================
+
+/** Deterministic event categories for admin notifications. */
+export const NotificationEventType = {
+  /** Provider submission permanently rejected the order (4xx non-429). */
+  OrderPermanentFailure: "order.permanentFailure",
+  /** Order parked for manual review (ambiguous outcome / max retries exhausted). */
+  OrderNeedsReview: "order.needsReview",
+  /** Order reached MAX_SUBMISSION_ATTEMPTS without a definitive result. */
+  OrderMaxRetries: "order.maxRetries",
+  /** Provider returned an ambiguous result that cannot be auto-resolved. */
+  OrderAmbiguousResult: "order.ambiguousResult",
+  /** Provider status polling failed N consecutive times for an order. */
+  OrderPollingFailed: "order.pollingFailed",
+} as const;
+export type NotificationEventType = (typeof NotificationEventType)[keyof typeof NotificationEventType];
+
+/** Severity levels for triage prioritisation. */
+export const NotificationSeverity = {
+  Info: "info",
+  Warning: "warning",
+  Critical: "critical",
+} as const;
+export type NotificationSeverity = (typeof NotificationSeverity)[keyof typeof NotificationSeverity];
+
+/** Metadata fields that are safe to store for diagnostics. No secrets. */
+export type NotificationMetadata = {
+  smmProviderKind?: string;
+  smmProviderCode?: number | string;
+  smmProviderMessage?: string;
+  smmAttempt?: number;
+  pollFailureCount?: number;
+  failReason?: string;
+  workerBatchDue?: number;
+  workerBatchClaimed?: number;
+  workerBatchErrors?: string[];
+  [key: string]: unknown;
+};
+
+export interface IAdminNotification extends Document {
+  _id: mongoose.Types.ObjectId;
+  userId: mongoose.Types.ObjectId; // admin user who should see this
+  eventType: NotificationEventType;
+  severity: NotificationSeverity;
+  title: string;
+  message: string;
+  orderId?: mongoose.Types.ObjectId | null;
+  relatedUserId?: mongoose.Types.ObjectId | null; // user who owns the affected order/transaction
+  transactionId?: mongoose.Types.ObjectId | null;
+  read: boolean;
+  /** Deterministic key — unique, idempotent. `<logicalEventKey>:<recipientAdminId>`. */
+  eventKey: string;
+  /** Optional diagnostics metadata. No passwords, tokens, API keys, or secrets. */
+  metadata?: NotificationMetadata | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const AdminNotificationSchema = new Schema<IAdminNotification>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    eventType: {
+      type: String,
+      required: true,
+      enum: Object.values(NotificationEventType),
+    },
+    severity: {
+      type: String,
+      required: true,
+      enum: Object.values(NotificationSeverity),
+      default: NotificationSeverity.Info,
+    },
+    title: { type: String, required: true, maxlength: 200 },
+    message: { type: String, required: true, maxlength: 4000 },
+    orderId: { type: Schema.Types.ObjectId, ref: "Order", default: null },
+    relatedUserId: { type: Schema.Types.ObjectId, ref: "User", default: null },
+    transactionId: { type: Schema.Types.ObjectId, ref: "Transaction", default: null },
+    read: { type: Boolean, required: true, default: false, index: true },
+    eventKey: { type: String, required: true, maxlength: 256, unique: true },
+    metadata: {
+      type: Object,
+      default: null,
+      validate: {
+        validator: function (value: unknown): boolean {
+          if (value === null || value === undefined) return true;
+          if (typeof value !== "object" || Array.isArray(value)) return false;
+          const keys = Object.keys(value as Record<string, unknown>);
+          const forbidden = new Set([
+            "password", "apiKey", "api_secret", "secret", "token", "accessToken",
+            "refreshToken", "razorpaySecret", "encryptionKey", "privateKey",
+          ]);
+          return !keys.some((k) => forbidden.has(k.toLowerCase().trim()));
+        },
+        message:
+          "Notification metadata must not contain secret-bearing fields (password, apiKey, secret, token, etc.)",
+      },
+    },
+  },
+  { timestamps: true },
+);
+
+// List/read-timeline index: "notifications for admin X, newest first, optionally filtered by read status".
+AdminNotificationSchema.index({ userId: 1, read: 1, createdAt: -1 });
+// Unread-count index: fast COUNT of unread notifications per admin.
+AdminNotificationSchema.index({ userId: 1, read: 1 });
+// Reverse-chronological feed for "recent operational events" across the panel.
+AdminNotificationSchema.index({ createdAt: -1 });
+
+export const AdminNotification = (
+  mongoose.models.AdminNotification as mongoose.Model<IAdminNotification> ||
+  mongoose.model<IAdminNotification>("AdminNotification", AdminNotificationSchema)
+);
+
 // ============================================================================
 
 // Reuse existing models during Next.js development hot reloads.

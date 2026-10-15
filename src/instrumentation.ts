@@ -16,10 +16,11 @@ const REQUIRED_COLLECTIONS = [
   "rateLimitBuckets",
   "siteSettings",
   "adminAuditLogs",
+  "adminNotifications",
 ];
 
 async function checkMongoDBConnected() {
-  const { connectDB, User, Category, Service, Order, Transaction, SupportTicket, RateLimitBucket, SiteSettings, AdminAuditLog } = await import("@/db");
+  const { connectDB, User, Category, Service, Order, Transaction, SupportTicket, RateLimitBucket, SiteSettings, AdminAuditLog, AdminNotification } = await import("@/db");
 
   try {
     await connectDB();
@@ -32,7 +33,7 @@ async function checkMongoDBConnected() {
   }
 
   // Verify collections exist by checking if we can query them
-  const models = { users: User, categories: Category, services: Service, orders: Order, transactions: Transaction, supportTickets: SupportTicket, rateLimitBuckets: RateLimitBucket, siteSettings: SiteSettings, adminAuditLogs: AdminAuditLog };
+  const models = { users: User, categories: Category, services: Service, orders: Order, transactions: Transaction, supportTickets: SupportTicket, rateLimitBuckets: RateLimitBucket, siteSettings: SiteSettings, adminAuditLogs: AdminAuditLog, adminNotifications: AdminNotification };
   
   for (const [name, model] of Object.entries(models)) {
     try {
@@ -79,4 +80,13 @@ export async function register() {
      
     console.error("[startup] FATAL: seeding failed —", error);
   }
+
+  // Phase 2C-3: automatic order-worker execution. Starts a bounded, overlap-
+  // safe in-process scheduler on Node hosts. The authenticated
+  // /api/orders/process endpoint (x-cron-secret) remains the entry point for
+  // external schedulers (Vercel Cron / Linux cron) — set
+  // ORDER_WORKER_ENABLED=false there to avoid double-driving.
+  const { startOrderWorkerScheduler } = await import("@/lib/worker-scheduler");
+  startOrderWorkerScheduler();
+
 }

@@ -18,7 +18,7 @@
  * /api/payment/create-order → webhook credits the balance).
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import { ShoppingCart } from "lucide-react";
 import {
@@ -44,10 +44,11 @@ type Service = {
 
 type OrderResponse = {
   orderId: string;
-  smmOrderId: number;
+  smmOrderId: number | null;
   status: string;
   chargedCredits: number;
   balance: number;
+  duplicate?: boolean;
 };
 
 export default function ServiceOrderForm() {
@@ -60,6 +61,10 @@ export default function ServiceOrderForm() {
   const [quantity, setQuantity] = useState("");
   const [loadingServices, setLoadingServices] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // Idempotency key (Phase 2C-4): reused across re-submissions of the SAME
+  // logical order (e.g. a duplicate click while a request is in flight) so the
+  // server replays the original order instead of debiting the wallet twice.
+  const requestIdRef = useRef(crypto.randomUUID());
 
   useEffect(() => {
     void (async () => {
@@ -114,12 +119,27 @@ export default function ServiceOrderForm() {
     setSubmitting(true);
     const res = await apiFetch<OrderResponse>("/api/services/order", {
       method: "POST",
-      body: JSON.stringify({ serviceId: service.id, link, quantity: qty }),
+      body: JSON.stringify({
+        serviceId: service.id,
+        link,
+        quantity: qty,
+        // Idempotency: if this logical order is submitted again (duplicate
+        // click/retry), the server returns the original order untouched.
+        clientRequestId: requestIdRef.current,
+      }),
     });
     setSubmitting(false);
+    // A completed response is definitive — the NEXT order gets a fresh key. (A
+    // request that never produced a response is NOT regenerated here: retrying
+    // it reuses the old key and the server safely replays the original order.)
+    requestIdRef.current = crypto.randomUUID();
 
     if (!res.success || !res.data) return toast.error(res.message);
-    toast.success(`Order placed — provider order #${res.data.smmOrderId}`);
+    toast.success(
+      res.data.smmOrderId
+        ? `Order placed — provider order #${res.data.smmOrderId}`
+        : "Order placed — queued for provider submission",
+    );
     await refresh(); // pull the new credit balance into the UI
   };
 

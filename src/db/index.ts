@@ -12,6 +12,9 @@ import {
   SocialAccount,
   ScheduledPost,
   AnalyticsSnapshot,
+  AdminNotification,
+  NotificationEventType,
+  NotificationSeverity,
 } from "./mongodb-schema";
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -96,6 +99,9 @@ export {
   SocialAccount,
   ScheduledPost,
   AnalyticsSnapshot,
+  AdminNotification,
+  NotificationEventType,
+  NotificationSeverity,
 };
 
 export default mongoose;

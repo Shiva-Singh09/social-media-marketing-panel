@@ -139,6 +139,11 @@ export const processDueSchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).default(25),
 });
 
+/** POST /api/orders/process — order-worker cron/admin batch size. */
+export const processOrdersSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(25),
+});
+
 /* ------------------------------------------------------------------ */
 /* POST /api/services/order (credit deduction + provider order)        */
 /* ------------------------------------------------------------------ */
@@ -153,6 +158,23 @@ export const serviceOrderSchema = z.object({
   serviceId: objectIdSchema("Select a service"),
   link: publicHttpUrl,
   quantity: z.coerce.number().int().positive("Quantity must be a positive number").max(10_000_000),
+  /**
+   * Optional client idempotency key (Phase 2C-4). When provided, retries of
+   * the SAME request (double-click, network retry, refresh after timeout)
+   * return the original order instead of debiting the wallet again.
+   * Uniqueness is enforced per user by a partial unique index.
+   */
+  clientRequestId: z
+    .string()
+    .trim()
+    .min(8, "Client request id must be at least 8 characters")
+    .max(64, "Client request id must be at most 64 characters")
+    .regex(/^[A-Za-z0-9_-]+$/, "Client request id may only contain letters, numbers, dashes and underscores")
+    // The `manual-` prefix is reserved for the legacy manual-fulfilment route
+    // (POST /api/orders), which the order worker uses to exclude its orders —
+    // client keys with that prefix would silently never be auto-submitted.
+    .refine((v) => !v.startsWith("manual-"), "This client request id prefix is reserved")
+    .optional(),
 });
 
 /* ------------------------------------------------------------------ */
