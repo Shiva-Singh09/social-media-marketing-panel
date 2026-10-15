@@ -1,5 +1,14 @@
 import mongoose from "mongoose";
-import { Order, Service, Transaction, User } from "@/db";
+import {
+  AnalyticsSnapshot,
+  Order,
+  ScheduledPost,
+  Service,
+  SocialAccount,
+  SupportTicket,
+  Transaction,
+  User,
+} from "@/db";
 import { runInTransaction, txOpts } from "@/db/transactions";
 import { recordAudit } from "@/lib/audit";
 import { fail, handle, num, ok } from "@/lib/api";
@@ -147,14 +156,36 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ id: string }
     if (!id) return fail("Invalid user id", 400);
     if (String(id) === String(admin._id)) return fail("You cannot delete your own account", 400);
 
-    const deleted = await User.findByIdAndDelete(id);
-    if (!deleted) return fail("User not found", 404);
+    const target = await User.findById(id);
+    if (!target) return fail("User not found", 404);
+
+    // Privacy cascade (production-hardening): a deleted user must not leave
+    // behind records holding private or security-sensitive material — most
+    // importantly SocialAccount documents with AES-256-GCM encrypted OAuth
+    // tokens, plus support conversations, scheduled post content and
+    // analytics snapshots. Orders/transactions are deliberately KEPT: they
+    // are the financial ledger/audit trail for the deleted userId and must
+    // survive account deletion for compliance.
+    const { ok: succeeded } = await runInTransaction(async (session) => {
+      await Promise.all([
+        SocialAccount.deleteMany({ userId: id }, txOpts(session)),
+        SupportTicket.deleteMany({ userId: id }, txOpts(session)),
+        ScheduledPost.deleteMany({ userId: id }, txOpts(session)),
+        AnalyticsSnapshot.deleteMany({ userId: id }, txOpts(session)),
+      ]);
+      await User.findByIdAndDelete(id, txOpts(session));
+    });
+    if (!succeeded) return fail("User deletion failed", 500);
 
     await recordAudit({
       adminId: String(admin._id),
       action: "user.delete",
       targetType: "user",
       targetId: String(id),
+      details: {
+        cascaded: ["socialAccounts", "supportTickets", "scheduledPosts", "analyticsSnapshots"],
+        financialRecordsRetained: ["orders", "transactions"],
+      },
     });
 
     return ok({ id }, "User deleted");

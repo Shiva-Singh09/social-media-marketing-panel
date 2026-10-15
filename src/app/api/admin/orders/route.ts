@@ -1,5 +1,5 @@
 import { Order } from "@/db";
-import { handle, num, ok, parsePagination } from "@/lib/api";
+import { handle, literalSearchTerm, num, ok, parsePagination } from "@/lib/api";
 import { requireAdmin } from "@/lib/auth";
 import { asEnumValue, ORDER_STATUSES } from "@/lib/validators";
 
@@ -11,7 +11,8 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const { page, limit, offset } = parsePagination(url, 12);
     const status = asEnumValue(url.searchParams.get("status"), ORDER_STATUSES);
-    const search = url.searchParams.get("search")?.trim();
+    // Literal, length-bounded search — user input can never act as a regex.
+    const search = literalSearchTerm(url.searchParams.get("search"));
 
     const filter: Record<string, unknown> = {};
     if (status) filter.status = status;

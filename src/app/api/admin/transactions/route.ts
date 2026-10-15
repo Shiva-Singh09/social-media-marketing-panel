@@ -1,5 +1,5 @@
 import { Transaction, User } from "@/db";
-import { handle, num, ok, parsePagination } from "@/lib/api";
+import { handle, literalSearchTerm, num, ok, parsePagination } from "@/lib/api";
 import { requireAdmin } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
@@ -10,7 +10,8 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const { page, limit, offset } = parsePagination(url, 12);
     const type = url.searchParams.get("type");
-    const search = url.searchParams.get("search")?.trim();
+    // Literal, length-bounded search — user input can never act as a regex.
+    const search = literalSearchTerm(url.searchParams.get("search"));
 
     const filter: Record<string, unknown> = {};
     if (type === "credit" || type === "debit") filter.type = type;

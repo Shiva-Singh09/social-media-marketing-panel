@@ -1,4 +1,4 @@
-import { Order, Service, SupportTicket, Transaction, User } from "@/db";
+import { AdminNotification, Order, Service, SupportTicket, Transaction, User } from "@/db";
 import { handle, num, ok } from "@/lib/api";
 import { requireAdmin } from "@/lib/auth";
 
@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   return handle(async () => {
-    await requireAdmin(req);
+    const adminUser = await requireAdmin(req);
 
     const [
       userCount,
@@ -21,6 +21,7 @@ export async function GET(req: Request) {
       failedTxns,
       openTickets,
       ticketCount,
+      unreadNotifications,
     ] = await Promise.all([
       User.countDocuments(),
       User.countDocuments({ status: "blocked" }),
@@ -37,6 +38,9 @@ export async function GET(req: Request) {
       Transaction.countDocuments({ paymentStatus: "failed" }),
       SupportTicket.countDocuments({ status: { $ne: "closed" } }),
       SupportTicket.countDocuments(),
+      // Unread actionable operational notifications for the signed-in admin
+      // (Phase 2C-6). Real state only — no derived/fabricated metric.
+      AdminNotification.countDocuments({ userId: adminUser._id, read: false }),
     ]);
 
     const recentOrders = await Order.find()
@@ -88,6 +92,7 @@ export async function GET(req: Request) {
         },
         payments: { deposits: num(depositsDoc?.total), failed: failedTxns },
         tickets: { open: openTickets, total: ticketCount },
+        notifications: { unread: unreadNotifications },
         recentOrders: recentOrders.map((o: any) => ({
           id: o._id,
           status: o.status,
