@@ -6,12 +6,16 @@ import { getSettings } from "@/lib/settings";
 /**
  * Idempotent seeding (equivalent of `node seed/seedData.js`).
  *
- * Security note: there is NO hardcoded admin password. The admin account is
- * created only from `ADMIN_EMAIL` / `ADMIN_PASSWORD` environment variables —
- * if they are missing, seeding fails loudly instead of silently falling back
- * to a well-known credential pair. The optional demo customer account is
- * gated behind `SEED_DEMO_USER` (defaults to enabled outside production) so
- * production deployments don't ship a wallet-funded throwaway account.
+ * Security note: there is NO hardcoded credential in this module. The admin
+ * account is created only from `ADMIN_EMAIL` / `ADMIN_PASSWORD` environment
+ * variables — if they are missing, seeding fails loudly instead of silently
+ * falling back to a well-known credential pair.
+ *
+ * Phase 2C-5: the optional demo customer account (`SEED_DEMO_USER`,
+ * `DEMO_EMAIL`, `DEMO_PASSWORD`, `DEMO_STARTING_BALANCE`) was removed
+ * completely, so startup can never recreate demo credentials. The
+ * categories/services catalogue is still bootstrapped — the panel cannot take
+ * an order without it — and only when the categories collection is empty.
  */
 let seedPromise: Promise<void> | null = null;
 let seedFailure: string | null = null;
@@ -148,10 +152,6 @@ const SERVICE_SEED: Record<
   ],
 };
 
-function isProduction() {
-  return process.env.NODE_ENV === "production";
-}
-
 async function seedAdmin() {
   const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
   const adminPassword = process.env.ADMIN_PASSWORD;
@@ -177,39 +177,6 @@ async function seedAdmin() {
       role: "admin" as const,
       emailVerified: true,
       creditBalance: 0,
-    });
-  } catch (error: any) {
-    // Ignore duplicate key error
-    if (error.code !== 11000) throw error;
-  }
-}
-
-async function seedDemoUser() {
-  const enabled = (process.env.SEED_DEMO_USER ?? (isProduction() ? "false" : "true")) === "true";
-  if (!enabled) return;
-
-  const demoEmail = (process.env.DEMO_EMAIL ?? "demo@smmpanel.com").trim().toLowerCase();
-  const demoPassword = process.env.DEMO_PASSWORD;
-  const demoBalance = process.env.DEMO_STARTING_BALANCE ?? "500";
-
-  if (!demoPassword) {
-    throw new Error(
-      "SEED_DEMO_USER is enabled but DEMO_PASSWORD is not set. Either set DEMO_PASSWORD " +
-        "explicitly or set SEED_DEMO_USER=false to skip creating the demo account.",
-    );
-  }
-  if (demoPassword.length < 8) {
-    throw new Error("DEMO_PASSWORD must be at least 8 characters long.");
-  }
-
-  try {
-    await User.create({
-      name: "Demo User",
-      email: demoEmail,
-      password: await hashPassword(demoPassword),
-      role: "user" as const,
-      emailVerified: true,
-      creditBalance: Number(demoBalance) || 0,
     });
   } catch (error: any) {
     // Ignore duplicate key error
@@ -246,7 +213,6 @@ async function runSeed() {
 
   await getSettings();
   await seedAdmin();
-  await seedDemoUser();
   await seedCatalogue();
 }
 
@@ -258,7 +224,17 @@ export function ensureSeeded(): Promise<void> {
       seedFailure = error instanceof Error ? error.message : "Unknown seeding error";
        
       console.error("[FATAL][seed:error]", seedFailure);
-      throw new HttpError(`Server not initialized: ${seedFailure}`, 503);
+      // seedFailure can contain configuration details (env-var names,
+      // generation commands, MongoDB/validation internals). Those stay in
+      // server logs and in the HEALTH_SECRET-gated /api/health payload —
+      // never in client-facing messages. Production clients receive a
+      // generic 503; non-production keeps the detail for debugging.
+      throw new HttpError(
+        process.env.NODE_ENV === "production"
+          ? "Service temporarily unavailable — please try again shortly."
+          : `Server not initialized: ${seedFailure}`,
+        503,
+      );
     });
   }
   return seedPromise;

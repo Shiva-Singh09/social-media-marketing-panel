@@ -280,8 +280,7 @@ export default async function HomePage() {
             </Link>
           </div>
           <p className="mt-4 text-xs text-slate-400">
-            Demo login — user: demo@smmpanel.com / Demo@123456 · admin: admin@smmpanel.com /
-            Admin@123456
+            Terms and conditions apply.
           </p>
         </div>
       </section>

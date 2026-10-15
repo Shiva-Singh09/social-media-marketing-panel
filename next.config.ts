@@ -13,10 +13,22 @@ const nextConfig: NextConfig = {
     // fresh per-request nonce for script-src, which is only available in
     // middleware (see src/middleware.ts). Only static, request-independent
     // headers live in next.config.
+    // HSTS is production-only: localhost/development runs plain HTTP, and a
+    // browser that once cached HSTS for localhost would refuse HTTP afterwards.
+    const hsts =
+      process.env.NODE_ENV === "production"
+        ? [
+            {
+              key: "Strict-Transport-Security",
+              value: "max-age=63072000; includeSubDomains",
+            },
+          ]
+        : [];
     return [
       {
         source: "/:path*",
         headers: [
+          ...hsts,
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "DENY" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },

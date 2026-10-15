@@ -55,11 +55,6 @@ export function LoginForm() {
     router.refresh();
   };
 
-  const fillDemo = (role: "user" | "admin") => {
-    setEmail(role === "admin" ? "admin@smmpanel.com" : "demo@smmpanel.com");
-    setPassword(role === "admin" ? "Admin@123456" : "Demo@123456");
-  };
-
   return (
     <Card className="p-6 sm:p-8">
       <h1 className="text-2xl font-bold text-white">Sign in</h1>
@@ -113,18 +108,6 @@ export function LoginForm() {
           Continue with Google
         </Button>
       </a>
-
-      <div className="mt-5 rounded-xl border border-slate-800 bg-slate-950/50 p-3">
-        <p className="text-xs font-medium text-slate-400">Demo accounts</p>
-        <div className="mt-2 flex gap-2">
-          <Button size="sm" variant="outline" type="button" onClick={() => fillDemo("user")}>
-            User demo
-          </Button>
-          <Button size="sm" variant="outline" type="button" onClick={() => fillDemo("admin")}>
-            Admin demo
-          </Button>
-        </div>
-      </div>
 
       <p className="mt-6 text-center text-sm text-slate-400">
         New here?{" "}

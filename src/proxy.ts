@@ -20,7 +20,7 @@ const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 //  - /api/payment/webhook  Razorpay calls it directly (verified via HMAC).
 //  - /api/posts/process    Cron workers call it with the x-cron-secret
 //                          header (or an admin session) — no browser involved.
-const CSRF_EXEMPT_PREFIXES = ["/api/payment/webhook", "/api/posts/process"];
+const CSRF_EXEMPT_PREFIXES = ["/api/payment/webhook", "/api/posts/process", "/api/orders/process"];
 
 function secretKey(): Uint8Array | null {
   const secret = process.env.JWT_SECRET ?? process.env.NEXTAUTH_SECRET;
@@ -186,6 +186,25 @@ export async function proxy(req: NextRequest) {
 
   const res = NextResponse.next({ request: { headers: requestHeaders } });
   res.headers.set("Content-Security-Policy", csp);
+
+  // HSTS: only ever emit over a verified HTTPS connection. Production browsers
+  // behind a single trusted reverse proxy see plain HTTP internally, so we trust
+  // the proxy's X-Forwarded-Proto only when TRUST_PROXY=true (the same gate used
+  // for acceptableOrigins above). Local development never gets HSTS.
+  const isHttps =
+    req.nextUrl.protocol === "https:" ||
+    (process.env.TRUST_PROXY === "true" &&
+      req.headers.get("x-forwarded-proto") === "https");
+  if (isHttps && process.env.NODE_ENV === "production") {
+    // max-age=31536000 (1 year); includeSubDomains.
+    // preload is NOT added automatically — it is a permanent commitment that
+    // requires the domain to be submitted to the HSTS preload list and is not
+    // appropriate unless the site operator has explicitly chosen to preload.
+    res.headers.set(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains",
+    );
+  }
   if (!existingCsrfCookie) {
     res.cookies.set(CSRF_COOKIE, generateCsrfToken(), {
       httpOnly: false,
