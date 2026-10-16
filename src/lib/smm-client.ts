@@ -114,6 +114,16 @@ async function smmRequest<T>(action: string, params: SmmParams = {}, options: Sm
 
       const text = await res.text();
 
+      // Provider signals failures either through HTTP status or `{ error }`.
+      // The status check MUST come before JSON parsing: error pages are often
+      // non-JSON (HTML/plaintext), and a parse failure must never mask a
+      // definitive 4xx (permanent) or 5xx (transient) verdict as "ambiguous".
+      if (!res.ok) {
+        throw new SmmApiError(`Provider request failed (HTTP ${res.status}).`, "provider", {
+          httpStatus: res.status,
+        });
+      }
+
       let json: unknown;
       try {
         json = JSON.parse(text) as unknown;
@@ -124,12 +134,6 @@ async function smmRequest<T>(action: string, params: SmmParams = {}, options: Sm
         );
       }
 
-      // Provider signals failures either through HTTP status or `{ error }`.
-      if (!res.ok) {
-        throw new SmmApiError(`Provider request failed (HTTP ${res.status}).`, "provider", {
-          httpStatus: res.status,
-        });
-      }
       if (json !== null && typeof json === "object" && "error" in json) {
         const message = (json as { error?: unknown }).error;
         throw new SmmApiError(

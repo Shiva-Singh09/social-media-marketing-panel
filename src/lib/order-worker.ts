@@ -205,7 +205,9 @@ async function notifyAdminsOf(params: {
           message: params.decision.message,
           orderId,
           relatedUserId: (params.relatedUserId ?? null) as string | null,
-          eventKey: `${params.decision.key}:${adminId}`,
+          // Logical key only — sendNotification() appends `:<adminId>` exactly
+          // once. Pre-scoping here would double-scope and break idempotency.
+          eventKey: params.decision.key,
           metadata: params.metadata ?? null,
         }),
       ),

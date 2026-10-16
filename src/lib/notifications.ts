@@ -97,7 +97,15 @@ export async function sendNotification(params: {
     // Idempotent: the stored key is scoped to the recipient so that MULTIPLE
     // admins each receive their own copy of one logical event, while a repeat
     // of that same logical event for the SAME admin is still suppressed.
-    const recipientKey = `${params.eventKey}:${String(params.userId)}`;
+    // Callers pass the LOGICAL key (e.g. `order.maxRetries:<orderId>`);
+    // scoping happens exactly once, here. A caller that already appended
+    // `:<adminId>` (legacy path) is detected by suffix match so we never
+    // double-scope to `<key>:<adminId>:<adminId>` (which would break
+    // idempotency: every retry would look like a new event).
+    const adminSuffix = `:${String(params.userId)}`;
+    const recipientKey = params.eventKey.endsWith(adminSuffix)
+      ? params.eventKey
+      : `${params.eventKey}:${String(params.userId)}`;
 
     // Skip if this exact logical event was already delivered to this admin.
     const existing = await AdminNotification.findOne({

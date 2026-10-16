@@ -160,13 +160,17 @@ test("events are persisted once and the unique index rejects a duplicate key", a
 });
 
 test("sendNotification is idempotent for a repeated eventKey", async () => {
+  // Isolate: count only THIS test's writes (earlier tests leave rows behind).
+  db.__resetDb(seed());
+  // Callers pass the LOGICAL key; sendNotification() scopes to the recipient
+  // exactly once. Repeating the same logical event must yield one row.
   const params = {
     userId: ADMIN,
     eventType: NotificationEventType.OrderMaxRetries,
     severity: NotificationSeverity.Critical,
     title: "Max retries exhausted",
     message: "Attempts exhausted",
-    eventKey: `${maxRetriesKey("order-2")}:${ADMIN}`,
+    eventKey: maxRetriesKey("order-2"),
     metadata: { smmAttempt: MAX },
   };
 
@@ -178,20 +182,24 @@ test("sendNotification is idempotent for a repeated eventKey", async () => {
 });
 
 test("concurrent duplicate write is tolerated as already-delivered (E11000)", async () => {
+  // Isolate: count only THIS test's writes (earlier tests leave rows behind).
+  db.__resetDb(seed());
+  // Logical key only (see above). Both writers race past the existence check:
+  // exactly one row survives and the loser's E11000 is swallowed, not surfaced.
   const params = {
     userId: ADMIN,
     eventType: NotificationEventType.OrderPermanentFailure,
     severity: NotificationSeverity.Critical,
     title: "Permanent failure",
     message: "Provider rejected the order",
-    eventKey: `${permanentFailureKey("order-3")}:${ADMIN}`,
+    eventKey: permanentFailureKey("order-3"),
   };
 
   // Both writers race past the existence check: exactly one row survives and
   // the loser's E11000 is swallowed, not surfaced.
   await Promise.all([
     (async () => {
-      await AdminNotification.findOne({ eventKey: params.eventKey }).lean();
+      await AdminNotification.findOne({ eventKey: `${params.eventKey}:${ADMIN}` }).lean();
       return sendNotification(params);
     })(),
     sendNotification(params),
@@ -256,7 +264,9 @@ test("unmapped service parks the order and emits one needsReview notification", 
 // ---------------------------------------------------------------------------
 
 test("permanent provider rejection emits one permanentFailure notification and refunds once", async () => {
-  db.__resetDb(seed({ orders: [orderDoc()] }));
+  // The customer already paid for this order when it was placed
+  // (100 − totalCost 13 = 87); the refund must return the wallet to 100.
+  db.__resetDb(seed({ users: [{ ...adminUser }, { ...customer, creditBalance: 87 }], orders: [orderDoc()] }));
   providerMode = "http400";
 
   const summary = await worker.processDueOrders(10);
