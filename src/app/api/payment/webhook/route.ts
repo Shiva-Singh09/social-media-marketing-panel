@@ -75,12 +75,11 @@ export async function POST(req: Request) {
       if (!current) return;
       if (current.paymentStatus !== PaymentStatus.PENDING) return; // already credited/failed
 
-      await User.findByIdAndUpdate(
-        current.userId,
-        { $inc: { creditBalance: amount } },
-        txOpts(session),
-      );
-      await Transaction.updateOne(
+      // Claim FIRST (P1): conditional PENDING→SUCCESS is the exactly-once
+      // mutex, matching the verify route. Only the winner proceeds to credit;
+      // a concurrent verify/webhook that already claimed sees PENDING gone,
+      // the conditional update matches 0 documents, and no credit happens.
+      const claimed = await Transaction.updateOne(
         { _id: current._id, paymentStatus: PaymentStatus.PENDING },
         {
           $set: {
@@ -88,6 +87,14 @@ export async function POST(req: Request) {
             razorpayPaymentId: entity.id ?? null,
           },
         },
+        txOpts(session),
+      );
+      if (claimed.matchedCount === 0 || (claimed.modifiedCount ?? 0) === 0) {
+        return; // another writer claimed first — do not credit twice
+      }
+      await User.findByIdAndUpdate(
+        current.userId,
+        { $inc: { creditBalance: amount } },
         txOpts(session),
       );
     });

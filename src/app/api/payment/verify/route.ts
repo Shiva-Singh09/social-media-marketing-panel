@@ -58,20 +58,41 @@ export async function POST(req: Request) {
 
     // Real ACID transaction on replica sets; sequential fallback on
     // standalone MongoDB (see src/db/transactions.ts).
-    const holder: { balance: number } = { balance: 0 };
+    //
+    // Conditional claim (P1): re-fetch the transaction inside the transaction
+    // so we see any concurrent commit, then only transition PENDING→SUCCESS.
+    // A concurrent verify/webhook that already committed leaves
+    // paymentStatus=success, so the conditional update matches 0 documents
+    // and we skip the credit — no double-credit under any interleaving.
+    const holder: { balance: number; credited: boolean } = { balance: 0, credited: false };
     const { ok: succeeded } = await runInTransaction(async (session) => {
+      // Claim FIRST: conditional PENDING→SUCCESS is the exactly-once mutex.
+      // Only the winner proceeds to credit; losers return without writing.
+      const claimed = await Transaction.updateOne(
+        { _id: txn._id, paymentStatus: "pending" },
+        {
+          $set: {
+            paymentStatus: "success",
+            razorpayPaymentId: paymentId,
+          },
+        },
+        txOpts(session),
+      );
+      if (claimed.matchedCount === 0) return; // another writer claimed first
+
       const updatedUser = await User.findByIdAndUpdate(
         user._id,
         { $inc: { creditBalance: amount } },
         { returnDocument: "after", ...txOpts(session) },
       );
-      txn.paymentStatus = "success";
-      txn.razorpayPaymentId = paymentId;
-      await txn.save(txOpts(session));
       holder.balance = num(updatedUser?.creditBalance);
+      holder.credited = true;
     });
 
     if (!succeeded) return fail("Payment verification failed", 500);
+    if (!holder.credited) {
+      return ok({ alreadyProcessed: true, balance: num(user.creditBalance) }, "Payment already credited");
+    }
 
     return ok({ balance: holder.balance, amount, paymentId }, `₹${amount.toFixed(2)} added to your balance`);
   });
