@@ -396,11 +396,11 @@ async function failAndRefund(
     if (existingRefund) return updated;
 
     const refund = num(updated.totalCost);
-    await User.findByIdAndUpdate(
-      updated.userId,
-      { $inc: { creditBalance: refund } },
-      txOpts(session),
-    );
+    // Ledger row FIRST (P0): the sparse-unique refundForOrderId index is the
+    // exactly-once mutex. Only the first writer creates it; a concurrent
+    // refund hits E11000 and returns before moving any credit — no double
+    // credit even on the sequential standalone fallback (where the balance
+    // $inc and the ledger row are not jointly atomic).
     try {
       await Transaction.create(
         [
@@ -417,10 +417,15 @@ async function failAndRefund(
       );
     } catch (error) {
       // Concurrent refund won the race (admin route or another worker
-      // attempt): the unique refundForOrderId index guarantees only one
-      // refund Transaction exists — swallowing the duplicate is correct.
+      // attempt): no credit was moved by this writer — swallow the duplicate.
       if (!isDuplicateKeyError(error)) throw error;
+      return updated;
     }
+    await User.findByIdAndUpdate(
+      updated.userId,
+      { $inc: { creditBalance: refund } },
+      txOpts(session),
+    );
     return updated;
   });
 
