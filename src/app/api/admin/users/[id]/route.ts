@@ -73,6 +73,32 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   });
 }
 
+/**
+ * Thrown inside the admin-balance transaction when a debit would drive the
+ * balance below zero. Caught after the transaction and mapped to a 402
+ * response — never a 500 — so callers can distinguish insufficient funds
+ * from a genuine system failure.
+ */
+class InsufficientBalanceError extends Error {
+  readonly balance: number;
+  readonly required: number;
+  constructor(balance: number, required: number) {
+    super(
+      `Insufficient balance: current ₹${balance.toFixed(2)}, required ₹${required.toFixed(2)}`,
+    );
+    this.name = "InsufficientBalanceError";
+    this.balance = balance;
+    this.required = required;
+  }
+}
+
+class LastAdminError extends Error {
+  constructor() {
+    super("The last active administrator cannot be removed or disabled");
+    this.name = "LastAdminError";
+  }
+}
+
 export async function PUT(req: Request, ctx: { params: Promise<{ id: string }> }) {
   return handle(async () => {
     const admin = await requireAdmin(req);
@@ -92,28 +118,71 @@ export async function PUT(req: Request, ctx: { params: Promise<{ id: string }> }
     // Real ACID transaction on replica sets; sequential fallback on
     // standalone MongoDB (see src/db/transactions.ts).
     const holder: { updated: unknown } = { updated: null };
-    const { ok: succeeded } = await runInTransaction(async (session) => {
-      // Ensure creditBalance never goes negative.
-      const updated = await User.findByIdAndUpdate(
-        id,
-        [
-          {
-            $set: {
-              ...(name && { name }),
-              ...(role && { role }),
-              ...(status && { status }),
-              creditBalance: {
-                $cond: [
-                  { $gte: [{ $add: ["$creditBalance", balanceAdjustment ?? 0] }, 0] },
-                  { $add: ["$creditBalance", balanceAdjustment ?? 0] },
-                  0,
-                ],
-              },
-            },
-          },
-        ],
-        { returnDocument: "after", ...txOpts(session) },
-      );
+    const { ok: succeeded, error } = await runInTransaction(async (session) => {
+      // Re-fetch inside the transaction so we see any concurrent debit.
+      const current = await User.findById(id).session(session);
+      if (!current) return;
+
+      const removesActiveAdmin =
+        current.role === "admin" &&
+        current.status === "active" &&
+        ((role !== undefined && role !== "admin") ||
+          (status !== undefined && status !== "active"));
+      if (removesActiveAdmin) {
+        const activeAdminCount = await User.countDocuments({
+          role: "admin",
+          status: "active",
+        }).session(session ?? null);
+        if (activeAdminCount <= 1) throw new LastAdminError();
+      }
+
+      // Reject insufficient-balance adjustments inside the transaction,
+      // protected against concurrent debits. A clamped debit would record the
+      // full amount in the ledger while only partially deducting the wallet —
+      // a balance/ledger mismatch.
+      if (balanceAdjustment && balanceAdjustment < 0) {
+        const currentBalance = num(current.creditBalance);
+        if (currentBalance + balanceAdjustment < 0) {
+          throw new InsufficientBalanceError(currentBalance, Math.abs(balanceAdjustment));
+        }
+      }
+
+      const setFields: Record<string, unknown> = {};
+      if (name) setFields.name = name;
+      if (role) setFields.role = role;
+      if (status) setFields.status = status;
+
+      const update: Record<string, unknown> = {};
+      if (Object.keys(setFields).length > 0) update.$set = setFields;
+      if (balanceAdjustment && balanceAdjustment !== 0) {
+        update.$inc = { creditBalance: balanceAdjustment };
+      }
+
+      // Conditional atomic debit (P0): the write itself only applies when the
+      // balance still covers the debit AT WRITE TIME. A concurrent debit
+      // that committed first leaves too little balance, so this update
+      // matches 0 documents instead of driving the wallet negative — the
+      // server-side guard that serializes debits even under races.
+      const updated =
+        balanceAdjustment !== undefined && balanceAdjustment < 0
+          ? await User.findOneAndUpdate(
+              { _id: id, creditBalance: { $gte: Math.abs(balanceAdjustment) } },
+              update,
+              { returnDocument: "after", ...txOpts(session) },
+            )
+          : await User.findByIdAndUpdate(id, update, {
+              returnDocument: "after",
+              ...txOpts(session),
+            });
+      if (balanceAdjustment !== undefined && balanceAdjustment < 0 && !updated) {
+        const fresh = session
+          ? await User.findById(id).session(session)
+          : await User.findById(id);
+        throw new InsufficientBalanceError(
+          num(fresh?.creditBalance),
+          Math.abs(balanceAdjustment),
+        );
+      }
       holder.updated = updated;
 
       if (balanceAdjustment && balanceAdjustment !== 0) {
@@ -134,8 +203,20 @@ export async function PUT(req: Request, ctx: { params: Promise<{ id: string }> }
       }
     });
 
+    if (!succeeded) {
+      if (error instanceof InsufficientBalanceError) {
+        return fail(
+          `Insufficient balance: adjusting by ₹${balanceAdjustment!.toFixed(2)} would drive the balance below zero (current: ₹${error.balance.toFixed(2)}).`,
+          402,
+          { required: error.required, balance: error.balance },
+        );
+      }
+      if (error instanceof LastAdminError) return fail(error.message, 409);
+      return fail("User update failed", 500);
+    }
+
     const updated = holder.updated as InstanceType<typeof User> | null;
-    if (!succeeded || !updated) return fail("User update failed", 500);
+    if (!updated) return fail("User update failed", 500);
 
     await recordAudit({
       adminId: String(admin._id),
@@ -166,7 +247,16 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ id: string }
     // analytics snapshots. Orders/transactions are deliberately KEPT: they
     // are the financial ledger/audit trail for the deleted userId and must
     // survive account deletion for compliance.
-    const { ok: succeeded } = await runInTransaction(async (session) => {
+    const { ok: succeeded, error } = await runInTransaction(async (session) => {
+      const current = await User.findById(id).session(session);
+      if (!current) return;
+      if (current.role === "admin" && current.status === "active") {
+        const activeAdminCount = await User.countDocuments({
+          role: "admin",
+          status: "active",
+        }).session(session ?? null);
+        if (activeAdminCount <= 1) throw new LastAdminError();
+      }
       await Promise.all([
         SocialAccount.deleteMany({ userId: id }, txOpts(session)),
         SupportTicket.deleteMany({ userId: id }, txOpts(session)),
@@ -175,7 +265,10 @@ export async function DELETE(req: Request, ctx: { params: Promise<{ id: string }
       ]);
       await User.findByIdAndDelete(id, txOpts(session));
     });
-    if (!succeeded) return fail("User deletion failed", 500);
+    if (!succeeded) {
+      if (error instanceof LastAdminError) return fail(error.message, 409);
+      return fail("User deletion failed", 500);
+    }
 
     await recordAudit({
       adminId: String(admin._id),
