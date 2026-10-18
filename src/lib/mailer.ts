@@ -12,7 +12,7 @@ export async function sendEmail({ to, subject, html }: MailInput) {
 
   if (!host || !user || !pass) {
      
-    console.info(`[mail:dev] to=${to} subject="${subject}"\n${html}`);
+    console.info(`[mail:dev] message not delivered to=${to} subject="${subject}"`);
     return { delivered: false as const };
   }
 
@@ -26,7 +26,7 @@ export async function sendEmail({ to, subject, html }: MailInput) {
     } | null;
     if (!mod?.createTransport) {
        
-      console.info(`[mail:fallback] to=${to} subject="${subject}"`);
+      console.info(`[mail:fallback] message not delivered to=${to} subject="${subject}"`);
       return { delivered: false as const };
     }
     const transporter = mod.createTransport({

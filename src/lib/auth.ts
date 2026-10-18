@@ -101,13 +101,18 @@ export async function getTokenFromRequest(req?: Request): Promise<string | null>
 
 export type SafeUser = Omit<
   IUser,
-  "password" | "verificationToken" | "resetPasswordToken" | "resetPasswordExpires"
+  | "password"
+  | "verificationToken"
+  | "verificationTokenExpires"
+  | "resetPasswordToken"
+  | "resetPasswordExpires"
 >;
 
 export function toSafeUser(user: IUser): SafeUser {
   const {
     password: _password,
     verificationToken: _verificationToken,
+    verificationTokenExpires: _verificationTokenExpires,
     resetPasswordToken: _resetPasswordToken,
     resetPasswordExpires: _resetPasswordExpires,
     failedLoginAttempts: _failedLoginAttempts,

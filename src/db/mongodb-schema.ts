@@ -88,6 +88,7 @@ export interface IUser extends Document {
   status: UserStatus;
   emailVerified: boolean;
   verificationToken?: string | null;
+  verificationTokenExpires?: Date | null;
   resetPasswordToken?: string | null;
   resetPasswordExpires?: Date | null;
   /**
@@ -291,6 +292,7 @@ const UserSchema = new Schema<IUser>(
     },
     emailVerified: { type: Boolean, required: true, default: false },
     verificationToken: { type: String, default: null },
+    verificationTokenExpires: { type: Date, default: null },
     resetPasswordToken: { type: String, default: null },
     resetPasswordExpires: { type: Date, default: null },
     // Login-abuse tracking (P1 auth hardening, Task 3). Legacy documents
@@ -524,7 +526,7 @@ const TransactionSchema = new Schema<ITransaction>(
 );
 
 TransactionSchema.index({ userId: 1 });
-TransactionSchema.index({ razorpayOrderId: 1 }, { sparse: true });
+TransactionSchema.index({ razorpayOrderId: 1 }, { unique: true, sparse: true });
 /**
  * Refund idempotency constraint (P2): at most ONE refund transaction per
  * order. Sparse → nulls (payments, admin adjustments) are unindexed and can

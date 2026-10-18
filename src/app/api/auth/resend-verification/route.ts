@@ -4,6 +4,7 @@ import { fail, handle, ok } from "@/lib/api";
 import { getCurrentUser } from "@/lib/auth";
 import { sendEmail, verifyEmailEmail } from "@/lib/mailer";
 import { limitOrFail } from "@/lib/rate-limit";
+import { hashSecurityToken } from "@/lib/security-tokens";
 
 export const dynamic = "force-dynamic";
 
@@ -22,7 +23,10 @@ export async function POST(req: Request) {
     if (limited) return fail(limited, 429);
 
     const verificationToken = crypto.randomBytes(24).toString("hex");
-    await User.findByIdAndUpdate(user._id, { verificationToken });
+    await User.findByIdAndUpdate(user._id, {
+      verificationToken: hashSecurityToken(verificationToken),
+      verificationTokenExpires: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    });
 
     const origin = process.env.FRONTEND_URL ?? new URL(req.url).origin;
     const delivery = await sendEmail({
@@ -33,12 +37,12 @@ export async function POST(req: Request) {
 
     return ok(
       {
-        sent: true,
-        verifyLink: delivery.delivered ? null : `${origin}/api/auth/verify-email/${verificationToken}`,
+        sent: delivery.delivered,
+        verifyLink: null,
       },
       delivery.delivered
         ? "Verification email sent — please check your inbox."
-        : "SMTP not configured — use the link below to verify.",
+        : "Verification email could not be delivered. Please try again later or contact support.",
     );
   });
 }

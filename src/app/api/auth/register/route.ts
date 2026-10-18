@@ -6,6 +6,7 @@ import { sendEmail, verifyEmailEmail } from "@/lib/mailer";
 import { limitOrFail } from "@/lib/rate-limit";
 import { ensureSeeded } from "@/lib/seed";
 import { firstError, registerSchema } from "@/lib/validators";
+import { hashSecurityToken } from "@/lib/security-tokens";
 
 export const dynamic = "force-dynamic";
 
@@ -34,12 +35,13 @@ export async function POST(req: Request) {
       name,
       email: email.toLowerCase(),
       password: await hashPassword(password),
-      verificationToken,
+      verificationToken: hashSecurityToken(verificationToken),
+      verificationTokenExpires: new Date(Date.now() + 24 * 60 * 60 * 1000),
       lastLogin: new Date(),
     });
 
     const origin = process.env.FRONTEND_URL ?? new URL(req.url).origin;
-    await sendEmail({
+    const delivery = await sendEmail({
       to: created.email,
       subject: "Verify your SMM Panel email",
       html: verifyEmailEmail(created.name, `${origin}/api/auth/verify-email/${verificationToken}`),
@@ -55,7 +57,9 @@ export async function POST(req: Request) {
 
     return ok(
       { user: toSafeUser(created) },
-      "Account created — check your email to verify your address before placing orders.",
+      delivery.delivered
+        ? "Account created — check your email to verify your address before placing orders."
+        : "Account created. Email delivery is currently unavailable; contact support to verify your address.",
       201,
     );
   });

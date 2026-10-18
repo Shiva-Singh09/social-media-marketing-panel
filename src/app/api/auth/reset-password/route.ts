@@ -3,6 +3,7 @@ import { fail, handle, ok } from "@/lib/api";
 import { hashPassword } from "@/lib/auth";
 import { limitOrFail } from "@/lib/rate-limit";
 import { firstError, resetPasswordSchema } from "@/lib/validators";
+import { hashSecurityToken } from "@/lib/security-tokens";
 
 export const dynamic = "force-dynamic";
 
@@ -18,20 +19,26 @@ export async function POST(req: Request) {
     if (!parsed.success) return fail(firstError(parsed.error), 422);
     const { token, password } = parsed.data;
 
-    const user = await User.findOne({ resetPasswordToken: token });
+    const user = await User.findOneAndUpdate(
+      {
+        $or: [
+          { resetPasswordToken: hashSecurityToken(token) },
+          { resetPasswordToken: token },
+        ],
+        resetPasswordExpires: { $gt: new Date() },
+      },
+      {
+        $set: {
+          password: await hashPassword(password),
+          resetPasswordToken: null,
+          resetPasswordExpires: null,
+        },
+        $inc: { sessionVersion: 1 },
+      },
+      { returnDocument: "after" },
+    );
 
-    if (!user) return fail("This reset link is invalid", 400);
-    if (!user.resetPasswordExpires || user.resetPasswordExpires.getTime() < Date.now()) {
-      return fail("This reset link has expired", 400);
-    }
-
-    user.password = await hashPassword(password);
-    user.resetPasswordToken = null;
-    user.resetPasswordExpires = null;
-    // Invalidate every previously issued JWT (including a stolen session):
-    // getCurrentUser() rejects tokens whose `sv` no longer matches.
-    user.sessionVersion = (user.sessionVersion ?? 0) + 1;
-    await user.save();
+    if (!user) return fail("This reset link is invalid or expired", 400);
 
     return ok({ email: user.email }, "Password updated — you can sign in now");
   });

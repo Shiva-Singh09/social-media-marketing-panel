@@ -1,4 +1,5 @@
 import { User } from "@/db";
+import { hashSecurityToken } from "@/lib/security-tokens";
 
 export const dynamic = "force-dynamic";
 
@@ -10,15 +11,28 @@ export async function GET(req: Request, ctx: { params: Promise<{ token: string }
   const origin = new URL(req.url).origin;
   const { token } = await ctx.params;
 
-  const user = await User.findOne({ verificationToken: token });
+  const user = await User.findOneAndUpdate(
+    {
+      $or: [
+        { verificationToken: hashSecurityToken(token) },
+        { verificationToken: token },
+      ],
+      verificationTokenExpires: { $gt: new Date() },
+      emailVerified: false,
+    },
+    {
+      $set: {
+        emailVerified: true,
+        verificationToken: null,
+        verificationTokenExpires: null,
+      },
+    },
+    { returnDocument: "after" },
+  );
 
   if (!user) {
     return Response.redirect(`${origin}/login?verify=invalid`, 302);
   }
-
-  user.emailVerified = true;
-  user.verificationToken = null;
-  await user.save();
 
   return Response.redirect(`${origin}/login?verify=success`, 302);
 }
