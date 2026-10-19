@@ -68,7 +68,23 @@ export async function verifyToken() { return null; }
 export async function setSessionCookie() {}
 export async function clearSessionCookie() {}
 export async function getTokenFromRequest() { return null; }
-export function toSafeUser(user) { return user?.toObject?.() ?? user; }
+export function toSafeUser(user) {
+  // Mirror the real @/lib/auth toSafeUser contract: security-sensitive fields
+  // must never leave the API, even through the stubbed auth module.
+  const raw = user?.toObject?.() ?? user;
+  if (!raw || typeof raw !== "object") return raw;
+  const {
+    password: _password,
+    verificationToken: _verificationToken,
+    verificationTokenExpires: _verificationTokenExpires,
+    resetPasswordToken: _resetPasswordToken,
+    resetPasswordExpires: _resetPasswordExpires,
+    failedLoginAttempts: _failedLoginAttempts,
+    loginLockUntil: _loginLockUntil,
+    ...safe
+  } = raw;
+  return safe;
+}
 `;
 
 const stubDbTransactionsSource = `
@@ -100,7 +116,7 @@ const stubDbSchemaSource = `
 // The model layer (User/Service/Order/Transaction) lives in the @/db stub;
 // re-export it so real modules that import models from @/db/mongodb-schema
 // see the exact same in-memory stores. Both stubs activate together.
-export { Order, Service, Transaction, User, AdminNotification, AdminAuditLog, NotificationEventType, NotificationSeverity } from "@/db";
+export { Category, Order, Service, Transaction, User, AdminNotification, AdminAuditLog, NotificationEventType, NotificationSeverity } from "@/db";
 
 export const RateLimitBucket = {
   async findById(id) {
@@ -124,6 +140,11 @@ export const RateLimitBucket = {
       for (const [k, v] of Object.entries(update.$inc)) bucket[k] = (bucket[k] ?? 0) + v;
     }
     return bucket;
+  },
+  // @/lib/seed opportunistically purges expired buckets at startup; model it
+  // as a no-op so seeding under the in-memory stub never crashes.
+  async deleteMany() {
+    return { acknowledged: true, deletedCount: 0 };
   },
 };
 
@@ -170,6 +191,16 @@ export const SiteSettings = {
     return mutable(cfgSettings().settings);
   },
 };
+
+export const OrderStatus = {
+  PENDING: "pending",
+  PROCESSING: "processing",
+  IN_PROGRESS: "in_progress",
+  COMPLETED: "completed",
+  PARTIAL: "partial",
+  CANCELLED: "cancelled",
+  FAILED: "failed",
+};
 `;
 
 let stubDbSource = `
@@ -186,6 +217,7 @@ function cfg() {
     c.stores = {
       users: new Map(),
       services: new Map(),
+      categories: new Map(),
       orders: new Map(),
       transactions: new Map(),
       notifications: new Map(),
@@ -271,9 +303,29 @@ function applyUpdate(doc, update) {
     for (const [k, v] of Object.entries(set)) doc[k] = evalExpr(v, doc);
     return;
   }
-  if (update.$set) for (const [k, v] of Object.entries(update.$set)) doc[k] = v;
-  if (update.$inc) for (const [k, v] of Object.entries(update.$inc)) doc[k] = round2((doc[k] ?? 0) + v);
-  if (update.$unset) for (const [k] of Object.entries(update.$unset)) delete doc[k];
+
+  // Plain document update (e.g. { status: "cancelled", startCount: undefined,
+  // remains: undefined }): these are the fields a MongoDB update document
+  // normally sets directly. Keep the existing $set/$inc/$unset handling for
+  // when those operators are present.
+  if (update && typeof update === "object") {
+    if (update.$set) {
+      for (const [k, v] of Object.entries(update.$set)) doc[k] = v;
+    }
+    if (update.$inc) {
+      for (const [k, v] of Object.entries(update.$inc)) doc[k] = round2((doc[k] ?? 0) + v);
+    }
+    if (update.$unset) {
+      for (const [k] of Object.entries(update.$unset)) delete doc[k];
+    }
+    if (update.$set === undefined && update.$inc === undefined && update.$unset === undefined) {
+      for (const [k, v] of Object.entries(update)) {
+        if (k === "$set" || k === "$inc" || k === "$unset") continue;
+        doc[k] = v !== undefined ? v : undefined;
+      }
+    }
+  }
+
   doc.updatedAt = new Date();
 }
 
@@ -428,10 +480,55 @@ export const Order = {
     }
     return null;
   },
+
+  findById(id) {
+    return cfg().stores.orders.get(String(id)) ?? null;
+  },
+
+  findByIdAndUpdate(id, update) {
+    const doc = cfg().stores.orders.get(String(id));
+    if (!doc) return null;
+    applyUpdate(doc, update);
+    return { ...doc };
+  },
 };
 
 export const User = {
   find(filter = {}) { return findChain("users", filter); },
+  findOne(filter = {}) { return findOneQuery("users", filter); },
+  // Mirrors the unique email index: a duplicate create throws with
+  // \`code: 11000\` so callers (e.g. @/lib/seed) can detect and ignore it.
+  async create(doc) {
+    const email = typeof doc.email === "string" ? doc.email.toLowerCase() : null;
+    if (email) {
+      for (const d of cfg().stores.users.values()) {
+        if (String(d.email ?? "").toLowerCase() === email) {
+          const err = new Error('E11000 duplicate key error collection: smm.users index: email_1 dup key: { email: "' + email + '" }');
+          err.code = 11000;
+          throw err;
+        }
+      }
+    }
+    return wrap("users", doc);
+  },
+  // Thenable count with .session() so transactional readers (admin routes)
+  // can await it exactly the way they await the Mongoose query.
+  countDocuments(filter = {}) {
+    const compute = () => [...cfg().stores.users.values()].filter((d) => matches(d, filter)).length;
+    const chain = {
+      session() { return chain; },
+      select() { return chain; },
+      then(resolve, reject) { return Promise.resolve().then(compute).then(resolve, reject); },
+    };
+    return chain;
+  },
+  async findByIdAndDelete(id) {
+    const key = String(id);
+    const doc = cfg().stores.users.get(key);
+    if (!doc) return null;
+    cfg().stores.users.delete(key);
+    return { ...doc };
+  },
   async findByIdAndUpdate(id, update) {
     const user = cfg().stores.users.get(String(id));
     if (!user) return null;
@@ -441,9 +538,36 @@ export const User = {
     // document as of that statement).
     return { ...user };
   },
+
+  // Required by the production admin-balance route: find one and apply the
+  // conditional ($gte) debit guard inside the same transactional callback.
+  findById(id) {
+    const doc = cfg().stores.users.get(String(id));
+    if (!doc) return null;
+    // The real Mongoose document exposes .session() for transactional
+    // callers; the in-memory stand-in mirrors that surface.
+    const sessionable = { ...doc, session: () => sessionable };
+    return sessionable;
+  },
+
+  findOneAndUpdate(filter, update, opts = {}) {
+    for (const d of cfg().stores.users.values()) {
+      if (matches(d, filter)) {
+        applyUpdate(d, update);
+        // Snapshot, not the live store object: a concurrent request must never
+        // see its continuation resolved against a later write.
+        return { ...d };
+      }
+    }
+    return null;
+  },
 };
 
 export const Service = {
+  // Used by @/lib/seed (catalogue bootstrap).
+  async insertMany(docs) {
+    return docs.map((doc) => wrap("services", doc));
+  },
   findById(id) {
     return {
       populate() { return this; },
@@ -454,6 +578,23 @@ export const Service = {
     };
   },
 };
+
+// Category: statically imported by @/lib/seed (catalogue bootstrap) and the
+// legacy POST/GET /api/orders route — without this export those modules fail
+// to link against the in-memory @/db stub.
+export const Category = {
+  find(filter = {}) { return findChain("categories", filter); },
+  findOne(filter = {}) { return findOneQuery("categories", filter); },
+  async insertMany(docs) {
+    return docs.map((doc) => wrap("categories", doc));
+  },
+};
+
+// Privacy-cascade deleteMany targets used by the admin user-delete route.
+export const AnalyticsSnapshot = { async deleteMany() { return { acknowledged: true, deletedCount: 0 }; } };
+export const ScheduledPost = { async deleteMany() { return { acknowledged: true, deletedCount: 0 }; } };
+export const SocialAccount = { async deleteMany() { return { acknowledged: true, deletedCount: 0 }; } };
+export const SupportTicket = { async deleteMany() { return { acknowledged: true, deletedCount: 0 }; } };
 
 export const Transaction = {
   async create(docs) {
@@ -473,12 +614,12 @@ export const Transaction = {
     return { acknowledged: true, deletedCount: 0 };
   },
 };
-
 export function __resetDb(seed = {}) {
   const c = cfg();
   c.stores = {
     users: new Map(),
     services: new Map(),
+    categories: new Map(),
     orders: new Map(),
     transactions: new Map(),
     notifications: new Map(),
@@ -632,10 +773,13 @@ export function resolve(specifier, context, nextResolve) {
   // 1) Test-only stubs. `next/headers` is ALWAYS stubbed (tests never have a
   //    real request context; real auth.ts imports it transitively). The auth
   //    stub itself stays opt-in via SMM_TEST_MOCK_AUTH=1.
+  // The auth stub itself stays opt-in via SMM_TEST_MOCK_AUTH=1, and is
+  // REFUSED under production NODE_ENV: even if the flag leaked into a
+  // production process, authentication must never be replaced by the stub.
   if (specifier === "next/headers") {
     return { url: VIRTUAL_PREFIX + "next-headers", shortCircuit: true };
   }
-  if (process.env.SMM_TEST_MOCK_AUTH === "1") {
+  if (process.env.SMM_TEST_MOCK_AUTH === "1" && process.env.NODE_ENV !== "production") {
     if (specifier === "@/lib/auth") {
       return { url: VIRTUAL_PREFIX + "auth", shortCircuit: true };
     }

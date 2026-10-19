@@ -23,10 +23,14 @@ if (files.length === 0) {
 // Enable the auth/headers stubs for every suite; suites that import real
 // auth-adjacent modules get deterministic behavior, everything else is
 // unaffected (stubs are opt-in and never active outside `npm test`).
+// NODE_ENV is FORCED to "test": suites must never run under production
+// configuration (the module hooks additionally refuse the auth stub when
+// NODE_ENV === "production", so a leaked SMM_TEST_MOCK_AUTH can never
+// substitute authentication in a production process).
 const env = {
   ...process.env,
   SMM_TEST_MOCK_AUTH: "1",
-  NODE_ENV: process.env.NODE_ENV ?? "test",
+  NODE_ENV: "test",
 };
 
 const result = spawnSync(

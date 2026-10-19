@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node --import ./tests/register-hooks.mjs --test tests/"
+    "test": "node tests/run.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
